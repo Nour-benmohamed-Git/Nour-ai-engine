@@ -1,6 +1,4 @@
 import modal
-from fastapi.responses import JSONResponse
-
 app = modal.App("nour-engine")
 
 
@@ -16,10 +14,16 @@ image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
         "faster-whisper",
-        "nvidia-cublas-cu12",   # fixes libcublas.so.12 not found
-        "nvidia-cudnn-cu12",    # cuDNN for CTranslate2 GPU backend
+        "nvidia-cublas-cu12",   # provides libcublas.so.12
+        "nvidia-cudnn-cu12",    # provides libcudnn for CTranslate2 GPU backend
         "fastapi[standard]",
     )
+    .env({
+        # pip installs .so files into site-packages, but ctranslate2 uses dlopen()
+        # which only searches system paths + LD_LIBRARY_PATH
+        "LD_LIBRARY_PATH": "/usr/local/lib/python3.11/site-packages/nvidia/cublas/lib:"
+                           "/usr/local/lib/python3.11/site-packages/nvidia/cudnn/lib",
+    })
     .run_function(download_model)  # bake model weights into the image
 )
 
