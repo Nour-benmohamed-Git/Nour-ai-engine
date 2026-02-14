@@ -3,260 +3,212 @@ import modal
 app = modal.App("nour-engine")
 
 # ---------------------------------------------------------------------------
-# Shared transcription parameters
+# Parameters
 # ---------------------------------------------------------------------------
 WHISPER_MODEL = "large-v3-turbo"
-VAD_PARAMS = dict(
-    threshold=0.3,              # lower than default 0.5 — catch quieter speech
-    min_speech_duration_ms=100,  # lower than default 250 — keep short utterances
-    min_silence_duration_ms=300, # lower than default 2000 — don't merge across pauses
+WHISPER_VAD_PARAMS = dict(
+    threshold=0.3,
+    min_speech_duration_ms=100,
+    min_silence_duration_ms=300,
 )
+
+# Periodic transcription for real-time feedback (Tarteel-like)
+PERIODIC_TRANSCRIBE_S = 1.0     # transcribe every 1s for real-time word reveal
+MIN_AUDIO_S = 0.5               # minimum audio before first transcription
 
 
 def download_model():
-    """Pre-download model during image build → baked into the image layer.
-    Eliminates the ~60s model download on every cold start."""
+    """Pre-download models during image build so they're baked into the layer."""
     from faster_whisper import WhisperModel
-
     WhisperModel(WHISPER_MODEL, device="cpu", compute_type="auto")
 
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .apt_install("ffmpeg")  # robust audio decoding for all formats
+    .apt_install("ffmpeg")
     .pip_install(
         "faster-whisper",
-        "nvidia-cublas-cu12",   # provides libcublas.so.12
-        "nvidia-cudnn-cu12",    # provides libcudnn for CTranslate2 GPU backend
+        "nvidia-cublas-cu12",
+        "nvidia-cudnn-cu12",
         "fastapi[standard]",
-        "websockets",
     )
     .env({
-        # pip installs .so files into site-packages, but ctranslate2 uses dlopen()
-        # which only searches system paths + LD_LIBRARY_PATH
         "LD_LIBRARY_PATH": "/usr/local/lib/python3.11/site-packages/nvidia/cublas/lib:"
                            "/usr/local/lib/python3.11/site-packages/nvidia/cudnn/lib",
     })
-    .run_function(download_model)  # bake model weights into the image
+    .run_function(download_model)
 )
 
 
 # ---------------------------------------------------------------------------
-# Helper: write audio bytes to a temp file and return the path
+# Helpers
 # ---------------------------------------------------------------------------
-def _save_temp_audio(audio_bytes: bytes, ext: str = "m4a") -> str:
+def _save_temp_audio(data: bytes, ext: str = "wav") -> str:
     import tempfile
     with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as f:
-        f.write(audio_bytes)
+        f.write(data)
         return f.name
 
 
+def _build_wav(pcm: bytes, sr: int = 16000, ch: int = 1, bits: int = 16) -> bytes:
+    import struct
+    n = len(pcm)
+    header = struct.pack(
+        '<4sI4s4sIHHIIHH4sI',
+        b'RIFF', 36 + n, b'WAVE',
+        b'fmt ', 16, 1, ch, sr, sr * ch * bits // 8, ch * bits // 8, bits,
+        b'data', n,
+    )
+    return header + pcm
+
+
+def _transcribe_pcm(model, pcm: bytes, sr: int = 16000) -> list[str]:
+    """Transcribe raw PCM audio → list of word strings."""
+    import os
+    if len(pcm) < 3200:
+        return []
+    wav = _build_wav(pcm, sr)
+    path = _save_temp_audio(wav)
+    try:
+        segs, _ = model.transcribe(
+            path, language="ar", beam_size=5,
+            vad_filter=True, vad_parameters=WHISPER_VAD_PARAMS,
+            word_timestamps=True, condition_on_previous_text=False,
+        )
+        words: list[str] = []
+        found = False
+        for s in segs:
+            found = True
+            if s.words:
+                words.extend(w.word.strip() for w in s.words if w.word.strip())
+            elif s.text.strip():
+                words.append(s.text.strip())
+        if not found or not words:
+            segs2, _ = model.transcribe(
+                path, language="ar", beam_size=5,
+                vad_filter=False, word_timestamps=True,
+                condition_on_previous_text=False,
+            )
+            words = []
+            for s in segs2:
+                if s.words:
+                    words.extend(w.word.strip() for w in s.words if w.word.strip())
+                elif s.text.strip():
+                    words.append(s.text.strip())
+        return words
+    finally:
+        os.remove(path)
+
+
 # ---------------------------------------------------------------------------
-# NourEngine — GPU-accelerated Whisper on Modal
+# Real-time WebSocket ASGI app
+#
+# Protocol (all messages are JSON text):
+#   → Client sends config:  {"type":"config","sample_rate":16000}
+#   → Client streams audio: {"type":"audio","data":"<base64_pcm_16bit_mono>"}
+#   → Client sends finish:  {"type":"eof"}
+#
+#   ← Server sends periodically + on silence:
+#     {"words":["بسم","الله","الرحمن"], "is_final":false}
+#   ← Server sends final:
+#     {"words":[...], "is_final":true}
 # ---------------------------------------------------------------------------
-@app.cls(
-    gpu="A10G",             # 2× faster FP16 than T4, 24 GB VRAM
+@app.function(
+    gpu="A10G",
     image=image,
-    scaledown_window=300,   # containers linger 5 min after last request before scaling to 0
+    scaledown_window=300,
 )
-@modal.concurrent(max_inputs=4)
-class NourEngine:
-    @modal.enter()
-    def load(self):
-        from faster_whisper import WhisperModel
+@modal.concurrent(max_inputs=10)
+@modal.asgi_app()
+def nour_realtime():
+    from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+    from faster_whisper import WhisperModel
+    import json, traceback, base64, asyncio, time
 
-        self.model = WhisperModel(
-            WHISPER_MODEL,
-            device="cuda",
-            compute_type="float16",  # pure FP16, A10G has native FP16 Tensor Cores
-        )
+    web_app = FastAPI()
+    whisper = WhisperModel(WHISPER_MODEL, device="cuda", compute_type="float16")
 
-    # ------------------------------------------------------------------
-    # 1) Original POST endpoint — backward compatible, full text at once
-    # ------------------------------------------------------------------
-    @modal.fastapi_endpoint(method="POST")
-    def transcribe(self, data: dict):
-        import base64, os, traceback
-        from fastapi.responses import JSONResponse
-
-        try:
-            audio_bytes = base64.b64decode(data["audio_base64"])
-            ext = data.get("format", "m4a")
-            path = _save_temp_audio(audio_bytes, ext)
-
-            try:
-                segments, info = self.model.transcribe(
-                    path,
-                    language="ar",
-                    beam_size=5,
-                    vad_filter=True,
-                    vad_parameters=VAD_PARAMS,
-                    word_timestamps=True,
-                    condition_on_previous_text=False,
-                )
-                text = " ".join(s.text.strip() for s in segments)
-
-                # Fallback: if VAD filtered everything out, retry without VAD
-                if not text.strip():
-                    segments, info = self.model.transcribe(
-                        path,
-                        language="ar",
-                        beam_size=5,
-                        vad_filter=False,
-                        word_timestamps=True,
-                        condition_on_previous_text=False,
-                    )
-                    text = " ".join(s.text.strip() for s in segments)
-
-            finally:
-                os.remove(path)
-
-            return {"text": text, "language": info.language, "duration": info.duration}
-
-        except Exception:
-            traceback.print_exc()
-            return JSONResponse(
-                status_code=500,
-                content={"error": traceback.format_exc()},
-            )
-
-    # ------------------------------------------------------------------
-    # 2) SSE streaming POST — words arrive one-by-one as they decode
-    #    Client sends full audio (base64), receives an event stream of
-    #    individual words so the frontend can render them instantly.
-    #
-    #    Event format (text/event-stream):
-    #      data: {"word":"كلمة","start":0.42,"end":0.78,"segment_idx":0}
-    #      ...
-    #      data: {"done":true,"full_text":"...","language":"ar","duration":12.3}
-    # ------------------------------------------------------------------
-    @modal.fastapi_endpoint(method="POST")
-    def transcribe_stream(self, data: dict):
-        import base64, os, json, traceback
-        from fastapi.responses import StreamingResponse, JSONResponse
-
-        try:
-            audio_bytes = base64.b64decode(data["audio_base64"])
-            ext = data.get("format", "m4a")
-            path = _save_temp_audio(audio_bytes, ext)
-        except Exception:
-            traceback.print_exc()
-            return JSONResponse(
-                status_code=400,
-                content={"error": traceback.format_exc()},
-            )
-
-        def word_generator():
-            try:
-                segments, info = self.model.transcribe(
-                    path,
-                    language="ar",
-                    beam_size=5,
-                    vad_filter=True,
-                    vad_parameters=VAD_PARAMS,
-                    word_timestamps=True,
-                    condition_on_previous_text=False,
-                )
-
-                all_words = []
-                seg_idx = 0
-                found_speech = False
-                for segment in segments:
-                    found_speech = True
-                    if segment.words:
-                        for w in segment.words:
-                            word_text = w.word.strip()
-                            if word_text:
-                                all_words.append(word_text)
-                                payload = json.dumps({
-                                    "word": word_text,
-                                    "start": round(w.start, 3),
-                                    "end": round(w.end, 3),
-                                    "segment_idx": seg_idx,
-                                }, ensure_ascii=False)
-                                yield f"data: {payload}\n\n"
-                    else:
-                        # segment without word-level detail — emit whole text
-                        text = segment.text.strip()
-                        if text:
-                            all_words.append(text)
-                            payload = json.dumps({
-                                "word": text,
-                                "start": round(segment.start, 3),
-                                "end": round(segment.end, 3),
-                                "segment_idx": seg_idx,
-                            }, ensure_ascii=False)
-                            yield f"data: {payload}\n\n"
-                    seg_idx += 1
-
-                # Fallback: if VAD filtered everything out, retry without VAD
-                if not found_speech or not all_words:
-                    segments2, info = self.model.transcribe(
-                        path,
-                        language="ar",
-                        beam_size=5,
-                        vad_filter=False,
-                        word_timestamps=True,
-                        condition_on_previous_text=False,
-                    )
-                    all_words = []
-                    seg_idx = 0
-                    for segment in segments2:
-                        if segment.words:
-                            for w in segment.words:
-                                word_text = w.word.strip()
-                                if word_text:
-                                    all_words.append(word_text)
-                                    payload = json.dumps({
-                                        "word": word_text,
-                                        "start": round(w.start, 3),
-                                        "end": round(w.end, 3),
-                                        "segment_idx": seg_idx,
-                                    }, ensure_ascii=False)
-                                    yield f"data: {payload}\n\n"
-                        else:
-                            text = segment.text.strip()
-                            if text:
-                                all_words.append(text)
-                                payload = json.dumps({
-                                    "word": text,
-                                    "start": round(segment.start, 3),
-                                    "end": round(segment.end, 3),
-                                    "segment_idx": seg_idx,
-                                }, ensure_ascii=False)
-                                yield f"data: {payload}\n\n"
-                        seg_idx += 1
-
-                # Final summary event
-                done_payload = json.dumps({
-                    "done": True,
-                    "full_text": " ".join(all_words),
-                    "language": info.language,
-                    "duration": round(info.duration, 2),
-                }, ensure_ascii=False)
-                yield f"data: {done_payload}\n\n"
-
-            except Exception:
-                traceback.print_exc()
-                err_payload = json.dumps({"error": traceback.format_exc()})
-                yield f"data: {err_payload}\n\n"
-            finally:
-                os.remove(path)
-
-        return StreamingResponse(
-            word_generator(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",  # disable nginx buffering
-            },
-        )
-
-    # ------------------------------------------------------------------
-    # 3) Health / warm-up endpoint
-    #    GET /health — lightweight ping so the client can pre-warm the
-    #    container and check readiness before the user starts reciting.
-    # ------------------------------------------------------------------
-    @modal.fastapi_endpoint(method="GET")
-    def health(self):
+    @web_app.get("/health")
+    async def health():
         return {"status": "ok", "model": WHISPER_MODEL}
+
+    async def transcribe_async(pcm_bytes: bytes, sr: int) -> list[str]:
+        """Run transcription in thread pool to avoid blocking audio receive."""
+        return await asyncio.to_thread(_transcribe_pcm, whisper, pcm_bytes, sr)
+
+    @web_app.websocket("/ws")
+    async def ws_transcribe(ws: WebSocket):
+        await ws.accept()
+        try:
+            # 1) Config
+            config = json.loads(await ws.receive_text())
+            sr = config.get("sample_rate", 16000)
+
+            # 2) State
+            min_audio_bytes = int(MIN_AUDIO_S * sr * 2)
+            pcm = bytearray()
+            last_transcribe_time = 0.0
+            transcribe_task: asyncio.Task | None = None
+            ws_open = True
+
+            async def _do_periodic_transcribe(snapshot: bytes, is_final: bool):
+                """Run transcription in background and send result back."""
+                nonlocal last_transcribe_time
+                try:
+                    words = await transcribe_async(snapshot, sr)
+                    if ws_open:
+                        await ws.send_json({"words": words, "is_final": is_final})
+                    last_transcribe_time = time.time()
+                except Exception as e:
+                    print(f"[ws] transcribe error: {e}")
+
+            # 3) Receive audio, transcribe periodically (non-blocking)
+            while True:
+                raw_msg = await ws.receive_text()
+                msg = json.loads(raw_msg)
+
+                if msg.get("type") == "eof":
+                    break
+                if msg.get("type") != "audio":
+                    continue
+
+                chunk = base64.b64decode(msg["data"])
+                pcm.extend(chunk)
+
+                now = time.time()
+                prev_done = transcribe_task is None or transcribe_task.done()
+                enough_audio = len(pcm) >= min_audio_bytes
+                enough_time = now - last_transcribe_time >= PERIODIC_TRANSCRIBE_S
+
+                if prev_done and enough_audio and enough_time:
+                    transcribe_task = asyncio.create_task(
+                        _do_periodic_transcribe(bytes(pcm), False)
+                    )
+
+            # 4) Wait for any in-flight periodic transcription to finish
+            if transcribe_task and not transcribe_task.done():
+                try:
+                    await transcribe_task
+                except Exception:
+                    pass
+
+            # 5) Final transcription on all accumulated audio
+            words = await transcribe_async(bytes(pcm), sr) if pcm else []
+            await ws.send_json({"words": words, "is_final": True})
+
+        except WebSocketDisconnect:
+            pass
+        except Exception:
+            traceback.print_exc()
+            try:
+                await ws.send_json({"error": traceback.format_exc()})
+            except Exception:
+                pass
+        finally:
+            ws_open = False
+            try:
+                await ws.close()
+            except Exception:
+                pass
+
+    return web_app
