@@ -14,7 +14,14 @@ WHISPER_VAD_PARAMS = dict(
 
 # Periodic transcription for real-time feedback (Tarteel-like)
 PERIODIC_TRANSCRIBE_S = 1.0     # transcribe every 1s for real-time word reveal
-MIN_AUDIO_S = 0.5               # minimum audio before first transcription
+MIN_AUDIO_S = 1.0               # minimum audio before first transcription (avoid noise hallucinations)
+
+# Known Whisper hallucination patterns for Arabic
+HALLUCINATION_PATTERNS = {
+    "اشتركوا في القناة", "شكرا", "شكرا لكم", "السلام عليكم",
+    "تابعونا", "اشترك", "لا تنسوا الاشتراك", "مشاهدة ممتعة",
+    "تالي", "يكا",
+}
 
 
 def download_model():
@@ -62,39 +69,67 @@ def _build_wav(pcm: bytes, sr: int = 16000, ch: int = 1, bits: int = 16) -> byte
     return header + pcm
 
 
-def _transcribe_pcm(model, pcm: bytes, sr: int = 16000) -> list[str]:
+def _is_hallucination(text: str) -> bool:
+    """Check if transcribed text is a known Whisper hallucination."""
+    stripped = text.strip()
+    if stripped in HALLUCINATION_PATTERNS:
+        return True
+    # Detect repetition: same phrase repeated 3+ times
+    words = stripped.split()
+    if len(words) >= 6:
+        half = len(words) // 2
+        first_half = " ".join(words[:half])
+        second_half = " ".join(words[half:2 * half])
+        if first_half == second_half:
+            return True
+    return False
+
+
+def _transcribe_pcm(
+    model, pcm: bytes, sr: int = 16000, initial_prompt: str | None = None
+) -> list[str]:
     """Transcribe raw PCM audio → list of word strings."""
     import os
-    if len(pcm) < 3200:
+    if len(pcm) < sr * 2:  # less than 0.5s of audio
         return []
     wav = _build_wav(pcm, sr)
     path = _save_temp_audio(wav)
     try:
-        segs, _ = model.transcribe(
-            path, language="ar", beam_size=5,
-            vad_filter=True, vad_parameters=WHISPER_VAD_PARAMS,
-            word_timestamps=True, condition_on_previous_text=False,
+        segs, info = model.transcribe(
+            path,
+            language="ar",
+            beam_size=5,
+            temperature=0.0,
+            vad_filter=True,
+            vad_parameters=WHISPER_VAD_PARAMS,
+            word_timestamps=True,
+            condition_on_previous_text=False,
+            # --- Anti-hallucination (built-in faster-whisper flags) ---
+            no_speech_threshold=0.6,
+            log_prob_threshold=-1.0,
+            compression_ratio_threshold=2.4,
+            hallucination_silence_threshold=1.0,
+            suppress_blank=True,
+            suppress_tokens=[-1],
+            repetition_penalty=1.1,
+            no_repeat_ngram_size=3,
+            # --- Context biasing ---
+            initial_prompt=initial_prompt,
+            hotwords=initial_prompt,
         )
         words: list[str] = []
-        found = False
         for s in segs:
-            found = True
+            if s.no_speech_prob > 0.5:
+                continue
             if s.words:
                 words.extend(w.word.strip() for w in s.words if w.word.strip())
             elif s.text.strip():
                 words.append(s.text.strip())
-        if not found or not words:
-            segs2, _ = model.transcribe(
-                path, language="ar", beam_size=5,
-                vad_filter=False, word_timestamps=True,
-                condition_on_previous_text=False,
-            )
-            words = []
-            for s in segs2:
-                if s.words:
-                    words.extend(w.word.strip() for w in s.words if w.word.strip())
-                elif s.text.strip():
-                    words.append(s.text.strip())
+        # Filter hallucinations
+        text = " ".join(words)
+        if _is_hallucination(text):
+            print(f"[ws] filtered hallucination: {text}")
+            return []
         return words
     finally:
         os.remove(path)
@@ -126,38 +161,49 @@ def nour_realtime():
     import json, traceback, base64, asyncio, time
 
     web_app = FastAPI()
-    whisper = WhisperModel(WHISPER_MODEL, device="cuda", compute_type="float16")
+    whisper = WhisperModel(WHISPER_MODEL, device="cuda", compute_type="int8_float16")
 
     @web_app.get("/health")
     async def health():
         return {"status": "ok", "model": WHISPER_MODEL}
 
-    async def transcribe_async(pcm_bytes: bytes, sr: int) -> list[str]:
-        """Run transcription in thread pool to avoid blocking audio receive."""
-        return await asyncio.to_thread(_transcribe_pcm, whisper, pcm_bytes, sr)
-
     @web_app.websocket("/ws")
     async def ws_transcribe(ws: WebSocket):
         await ws.accept()
         try:
-            # 1) Config
+            # 1) Config — client sends expected_text for initial_prompt
             config = json.loads(await ws.receive_text())
             sr = config.get("sample_rate", 16000)
+            expected_text = config.get("expected_text", None)
 
-            # 2) State
+            # Use expected verse as initial_prompt to bias Whisper toward Quran
+            prompt = expected_text if expected_text else None
+
+            # 2) State — sliding window: only transcribe NEW audio
             min_audio_bytes = int(MIN_AUDIO_S * sr * 2)
-            pcm = bytearray()
+            pcm = bytearray()           # full accumulated audio
+            transcribed_up_to = 0       # byte offset already transcribed
+            confirmed_words: list[str] = []  # words from previous transcriptions
             last_transcribe_time = 0.0
             transcribe_task: asyncio.Task | None = None
             ws_open = True
 
-            async def _do_periodic_transcribe(snapshot: bytes, is_final: bool):
-                """Run transcription in background and send result back."""
-                nonlocal last_transcribe_time
+            async def _do_periodic_transcribe(
+                new_audio: bytes, snapshot_end: int, is_final: bool
+            ):
+                """Transcribe only new audio and prepend confirmed words."""
+                nonlocal last_transcribe_time, transcribed_up_to, confirmed_words
                 try:
-                    words = await transcribe_async(snapshot, sr)
-                    if ws_open:
-                        await ws.send_json({"words": words, "is_final": is_final})
+                    new_words = await asyncio.to_thread(
+                        _transcribe_pcm, whisper, new_audio, sr, prompt
+                    )
+                    all_words = confirmed_words + new_words
+                    if ws_open and all_words:
+                        await ws.send_json({"words": all_words, "is_final": is_final})
+                    # If we got words, confirm them and advance the window
+                    if new_words:
+                        confirmed_words = all_words
+                        transcribed_up_to = snapshot_end
                     last_transcribe_time = time.time()
                 except Exception as e:
                     print(f"[ws] transcribe error: {e}")
@@ -177,12 +223,15 @@ def nour_realtime():
 
                 now = time.time()
                 prev_done = transcribe_task is None or transcribe_task.done()
-                enough_audio = len(pcm) >= min_audio_bytes
+                new_audio_len = len(pcm) - transcribed_up_to
+                enough_audio = new_audio_len >= min_audio_bytes
                 enough_time = now - last_transcribe_time >= PERIODIC_TRANSCRIBE_S
 
                 if prev_done and enough_audio and enough_time:
+                    snapshot_end = len(pcm)
+                    new_audio = bytes(pcm[transcribed_up_to:snapshot_end])
                     transcribe_task = asyncio.create_task(
-                        _do_periodic_transcribe(bytes(pcm), False)
+                        _do_periodic_transcribe(new_audio, snapshot_end, False)
                     )
 
             # 4) Wait for any in-flight periodic transcription to finish
@@ -192,9 +241,16 @@ def nour_realtime():
                 except Exception:
                     pass
 
-            # 5) Final transcription on all accumulated audio
-            words = await transcribe_async(bytes(pcm), sr) if pcm else []
-            await ws.send_json({"words": words, "is_final": True})
+            # 5) Final transcription on remaining new audio
+            remaining = bytes(pcm[transcribed_up_to:])
+            if remaining and len(remaining) >= sr * 2:
+                final_words = await asyncio.to_thread(
+                    _transcribe_pcm, whisper, remaining, sr, prompt
+                )
+                all_words = confirmed_words + final_words
+            else:
+                all_words = confirmed_words
+            await ws.send_json({"words": all_words, "is_final": True})
 
         except WebSocketDisconnect:
             pass
