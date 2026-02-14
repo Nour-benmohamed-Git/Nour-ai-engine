@@ -13,8 +13,8 @@ WHISPER_VAD_PARAMS = dict(
 )
 
 # Periodic transcription for real-time feedback (Tarteel-like)
-PERIODIC_TRANSCRIBE_S = 1.0     # transcribe every 1s for real-time word reveal
-MIN_AUDIO_S = 1.0               # minimum audio before first transcription (avoid noise hallucinations)
+PERIODIC_TRANSCRIBE_S = 0.5     # transcribe every 0.5s for real-time word reveal
+MIN_AUDIO_S = 0.3               # minimum audio before first transcription
 
 # Known Whisper hallucination patterns for Arabic
 HALLUCINATION_PATTERNS = {
@@ -50,23 +50,10 @@ image = (
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def _save_temp_audio(data: bytes, ext: str = "wav") -> str:
-    import tempfile
-    with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as f:
-        f.write(data)
-        return f.name
-
-
-def _build_wav(pcm: bytes, sr: int = 16000, ch: int = 1, bits: int = 16) -> bytes:
-    import struct
-    n = len(pcm)
-    header = struct.pack(
-        '<4sI4s4sIHHIIHH4sI',
-        b'RIFF', 36 + n, b'WAVE',
-        b'fmt ', 16, 1, ch, sr, sr * ch * bits // 8, ch * bits // 8, bits,
-        b'data', n,
-    )
-    return header + pcm
+def _pcm_to_float(pcm: bytes) -> "np.ndarray":
+    """Convert raw 16-bit PCM bytes to float32 numpy array (no file I/O)."""
+    import numpy as np
+    return np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
 
 
 def _is_hallucination(text: str) -> bool:
@@ -88,51 +75,44 @@ def _is_hallucination(text: str) -> bool:
 def _transcribe_pcm(
     model, pcm: bytes, sr: int = 16000, initial_prompt: str | None = None
 ) -> list[str]:
-    """Transcribe raw PCM audio → list of word strings."""
-    import os
-    if len(pcm) < sr * 2:  # less than 0.5s of audio
+    """Transcribe raw PCM audio → list of word strings. Zero file I/O."""
+    if len(pcm) < sr:  # less than 0.25s of audio (16-bit = 2 bytes/sample)
         return []
-    wav = _build_wav(pcm, sr)
-    path = _save_temp_audio(wav)
-    try:
-        segs, info = model.transcribe(
-            path,
-            language="ar",
-            beam_size=5,
-            temperature=0.0,
-            vad_filter=True,
-            vad_parameters=WHISPER_VAD_PARAMS,
-            word_timestamps=True,
-            condition_on_previous_text=False,
-            # --- Anti-hallucination (built-in faster-whisper flags) ---
-            no_speech_threshold=0.6,
-            log_prob_threshold=-1.0,
-            compression_ratio_threshold=2.4,
-            hallucination_silence_threshold=1.0,
-            suppress_blank=True,
-            suppress_tokens=[-1],
-            repetition_penalty=1.1,
-            no_repeat_ngram_size=3,
-            # --- Context biasing ---
-            initial_prompt=initial_prompt,
-            hotwords=initial_prompt,
-        )
-        words: list[str] = []
-        for s in segs:
-            if s.no_speech_prob > 0.5:
-                continue
-            if s.words:
-                words.extend(w.word.strip() for w in s.words if w.word.strip())
-            elif s.text.strip():
-                words.append(s.text.strip())
-        # Filter hallucinations
-        text = " ".join(words)
-        if _is_hallucination(text):
-            print(f"[ws] filtered hallucination: {text}")
-            return []
-        return words
-    finally:
-        os.remove(path)
+    audio = _pcm_to_float(pcm)
+    segs, info = model.transcribe(
+        audio,
+        language="ar",
+        beam_size=1,                # greedy decoding — 3-5x faster than beam_size=5
+        temperature=0.0,
+        vad_filter=True,
+        vad_parameters=WHISPER_VAD_PARAMS,
+        word_timestamps=False,      # skip timestamp overhead
+        without_timestamps=True,    # skip timestamp token generation
+        condition_on_previous_text=False,
+        # --- Anti-hallucination (built-in faster-whisper flags) ---
+        no_speech_threshold=0.6,
+        log_prob_threshold=-1.0,
+        compression_ratio_threshold=2.4,
+        suppress_blank=True,
+        suppress_tokens=[-1],
+        repetition_penalty=1.1,
+        no_repeat_ngram_size=3,
+        # --- Context biasing ---
+        initial_prompt=initial_prompt,
+    )
+    words: list[str] = []
+    for s in segs:
+        if s.no_speech_prob > 0.5:
+            continue
+        text = s.text.strip()
+        if text:
+            words.extend(w for w in text.split() if w)
+    # Filter hallucinations
+    joined = " ".join(words)
+    if _is_hallucination(joined):
+        print(f"[ws] filtered hallucination: {joined}")
+        return []
+    return words
 
 
 # ---------------------------------------------------------------------------
@@ -176,39 +156,33 @@ def nour_realtime():
             sr = config.get("sample_rate", 16000)
             expected_text = config.get("expected_text", None)
 
-            # Use expected verse as initial_prompt to bias Whisper toward Quran
-            prompt = expected_text if expected_text else None
+            # Use a generic Quranic prompt to bias Whisper toward Quranic Arabic
+            # WITHOUT revealing the specific verse (which causes premature word reveal)
+            prompt = "بسم الله الرحمن الرحيم. القرآن الكريم."
 
-            # 2) State — sliding window: only transcribe NEW audio
+            # 2) State — full-buffer transcription for maximum accuracy
             min_audio_bytes = int(MIN_AUDIO_S * sr * 2)
-            pcm = bytearray()           # full accumulated audio
-            transcribed_up_to = 0       # byte offset already transcribed
-            confirmed_words: list[str] = []  # words from previous transcriptions
+            pcm = bytearray()
             last_transcribe_time = 0.0
             transcribe_task: asyncio.Task | None = None
             ws_open = True
 
             async def _do_periodic_transcribe(
-                new_audio: bytes, snapshot_end: int, is_final: bool
+                snapshot: bytes, is_final: bool
             ):
-                """Transcribe only new audio and prepend confirmed words."""
-                nonlocal last_transcribe_time, transcribed_up_to, confirmed_words
+                """Transcribe full accumulated audio for best context."""
+                nonlocal last_transcribe_time
                 try:
-                    new_words = await asyncio.to_thread(
-                        _transcribe_pcm, whisper, new_audio, sr, prompt
+                    words = await asyncio.to_thread(
+                        _transcribe_pcm, whisper, snapshot, sr, prompt
                     )
-                    all_words = confirmed_words + new_words
-                    if ws_open and all_words:
-                        await ws.send_json({"words": all_words, "is_final": is_final})
-                    # If we got words, confirm them and advance the window
-                    if new_words:
-                        confirmed_words = all_words
-                        transcribed_up_to = snapshot_end
+                    if ws_open and words:
+                        await ws.send_json({"words": words, "is_final": is_final})
                     last_transcribe_time = time.time()
                 except Exception as e:
                     print(f"[ws] transcribe error: {e}")
 
-            # 3) Receive audio, transcribe periodically (non-blocking)
+            # 3) Receive audio, transcribe full buffer periodically
             while True:
                 raw_msg = await ws.receive_text()
                 msg = json.loads(raw_msg)
@@ -223,15 +197,12 @@ def nour_realtime():
 
                 now = time.time()
                 prev_done = transcribe_task is None or transcribe_task.done()
-                new_audio_len = len(pcm) - transcribed_up_to
-                enough_audio = new_audio_len >= min_audio_bytes
+                enough_audio = len(pcm) >= min_audio_bytes
                 enough_time = now - last_transcribe_time >= PERIODIC_TRANSCRIBE_S
 
                 if prev_done and enough_audio and enough_time:
-                    snapshot_end = len(pcm)
-                    new_audio = bytes(pcm[transcribed_up_to:snapshot_end])
                     transcribe_task = asyncio.create_task(
-                        _do_periodic_transcribe(new_audio, snapshot_end, False)
+                        _do_periodic_transcribe(bytes(pcm), False)
                     )
 
             # 4) Wait for any in-flight periodic transcription to finish
@@ -241,16 +212,11 @@ def nour_realtime():
                 except Exception:
                     pass
 
-            # 5) Final transcription on remaining new audio
-            remaining = bytes(pcm[transcribed_up_to:])
-            if remaining and len(remaining) >= sr * 2:
-                final_words = await asyncio.to_thread(
-                    _transcribe_pcm, whisper, remaining, sr, prompt
-                )
-                all_words = confirmed_words + final_words
-            else:
-                all_words = confirmed_words
-            await ws.send_json({"words": all_words, "is_final": True})
+            # 5) Final transcription on full audio
+            words = await asyncio.to_thread(
+                _transcribe_pcm, whisper, bytes(pcm), sr, prompt
+            ) if pcm else []
+            await ws.send_json({"words": words, "is_final": True})
 
         except WebSocketDisconnect:
             pass
