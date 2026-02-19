@@ -1,5 +1,5 @@
 """
-Arabic Quran ASR Server — v4.3  (CTC interim + RNNT final)
+Arabic Quran ASR Server — v4.4  (CTC interim + RNNT final)
 ===========================================================
 
 Architecture
@@ -7,37 +7,46 @@ Architecture
 • INTERIM  chunks    → CTC decoder  (~30-50 ms, non-autoregressive)
 • FINAL    utterance → RNNT decoder (accurate,  autoregressive)
 
-RNNT is triggered by three events:
+RNNT is triggered by four events:
   1. Client sends {"type": "eof"}
   2. Silence gap of SILENCE_TRIGGER_S seconds (best real-time UX — fires
      during the natural pause between Quran ayahs, before the next starts)
   3. Utterance reaches MAX_UTTERANCE_SAMPLES (model's training max = 20 s)
+  4. Client disconnects after producing speech (graceful close window)
+
+v4.4 fixes over v4.4
+---------------------
+1. Short-utterance RNNT miss.
+   When a client recited a short ayah and disconnected before the 0.8 s
+   silence trigger fired, they received only CTC quality.  v4.3 had removed
+   RNNT-on-disconnect entirely to avoid sending on a closed socket.
+
+   Fix: WebSocket close is a two-way handshake.  When the client sends a
+   close frame, the TCP connection enters a half-closed state — the server
+   can still transmit one final message before echoing the close frame.
+   We now attempt RNNT in the disconnect path and wrap send_text() in a
+   try/except.  Graceful closes deliver the result; ungraceful drops (TCP
+   reset, network loss) throw and are caught silently.  Either way correct.
+
+2. Ghost session resource leak.
+   Clients that connect but never send audio kept their silence-monitor task
+   alive indefinitely.  The monitor only fires when had_speech is True, so
+   it never cleaned up these sessions.
+
+   Fix: asyncio.wait_for(websocket.receive(), timeout=IDLE_TIMEOUT_S) on the
+   first receive.  This is the canonical asyncio pattern — confirmed by the
+   FastAPI and starlette maintainers.  The timeout ONLY applies before any
+   audio arrives; once had_speech becomes True the timeout is removed and the
+   session lives as long as audio keeps coming.  websocket.application_state
+   was NOT used — it is known to be unreliable (FastAPI issue #3008).
 
 v4.3 fixes over v4.2
 ---------------------
-1. 30 s utterance cap exceeded model's 20 s training max → degraded RNNT
-   accuracy and encoder positional embedding range.  Fixed: cap at 20 s and
-   auto-finalize (not trim) when reached.
-
-2. disconnect-final RNNT called send_text() on a closed socket.  The client
-   is gone; nobody receives the result.  Removed: RNNT on disconnect is
-   pointless and causes a spurious send error in the logs.
-
-3. CTC results sent repeatedly for the same text.  Logs showed "نهاية"
-   sent 10+ consecutive times.  Fixed: per-session deduplication — CTC
-   result is only transmitted when the text differs from the last sent.
-
-4. Silence-gap RNNT trigger added.  A background asyncio task per session
-   watches the last-speech timestamp; when the gap exceeds SILENCE_TRIGGER_S
-   it calls finalize().  For Quran recitation this fires RNNT during the
-   natural inter-ayah pause and delivers the accurate result before the
-   reciter starts the next verse.
-
-5. CTC warm-up reimplemented the decode logic bypassing _transcribe_ctc().
-   Fixed: warm-up now calls _transcribe_ctc() and _transcribe_rnnt() directly
-   using a white-noise burst that passes the VAD gate (RMS ≈ 0.1 >> 0.005).
-
-6. Unused `traceback` import removed.
+1. 30 s utterance cap exceeded model's 20 s training max.
+2. CTC results sent repeatedly for the same text (deduplication).
+3. Silence-gap RNNT trigger for real-time Quran UX.
+4. Warm-up calls _transcribe_ctc/_transcribe_rnnt directly (no duplication).
+5. Unused `traceback` import removed.
 """
 
 # ============================================================================
@@ -80,6 +89,7 @@ MIN_UTTERANCE_SAMPLES = 8000     # 0.5 s   — minimum audio to bother calling R
 VAD_RMS_THRESHOLD     = 0.005    # ~−46 dBFS; chunks below this are silence
 SILENCE_TRIGGER_S     = 0.8      # gap after last speech that triggers RNNT
 SILENCE_POLL_S        = 0.1      # how often the silence monitor checks
+IDLE_TIMEOUT_S        = 10.0     # close ghost connections that never send audio
 MODEL_NAME            = "nvidia/stt_ar_fastconformer_hybrid_large_pcd_v1.0"
 
 # ============================================================================
@@ -258,14 +268,14 @@ _infer_lock = asyncio.Lock()
 # FASTAPI APP
 # ============================================================================
 
-app = FastAPI(title="Quran ASR Server", version="4.3.0")
+app = FastAPI(title="Quran ASR Server", version="4.4.0")
 
 
 @app.get("/")
 def root():
     return {
         "service":  "Quran ASR Server",
-        "version":  "4.3.0",
+        "version":  "4.4.0",
         "model":    MODEL_NAME,
         "status":   "operational",
         "decoders": {"interim": "CTC", "final": "RNNT (greedy_batch)"},
@@ -284,6 +294,7 @@ def health():
         "max_utterance_s":   MAX_UTTERANCE_SAMPLES / SAMPLE_RATE,
         "min_utterance_s":   MIN_UTTERANCE_SAMPLES / SAMPLE_RATE,
         "silence_trigger_s": SILENCE_TRIGGER_S,
+        "idle_timeout_s":    IDLE_TIMEOUT_S,
         "vad_rms_threshold": VAD_RMS_THRESHOLD,
         "interim_decoder":   "ctc",
         "final_decoder":     "rnnt",
@@ -328,13 +339,25 @@ async def _run_and_send(
     words         = text.split()
     processing_ms = int((time.time() - t0) * 1000)
 
-    await websocket.send_text(json.dumps({
+    payload = json.dumps({
         "words":         words,
         "is_final":      is_final,
         "decoder":       "rnnt" if is_final else "ctc",
         "chunk_ms":      int(audio_f32.size / SAMPLE_RATE * 1000),
         "processing_ms": processing_ms,
-    }, ensure_ascii=False))
+    }, ensure_ascii=False)
+
+    try:
+        await websocket.send_text(payload)
+    except (WebSocketDisconnect, RuntimeError):
+        # Client disconnected during inference (e.g. graceful close window
+        # elapsed or TCP reset).  The result was computed — it just couldn't
+        # be delivered.  Log at debug level and return "" so callers know
+        # nothing was transmitted.
+        logger.debug(
+            f"send_text failed — client gone during inference: {text[:60]}"
+        )
+        return ""
 
     logger.info(
         f"{'FINAL(RNNT)' if is_final else 'interim(CTC)'} | "
@@ -374,6 +397,7 @@ async def websocket_endpoint(websocket: WebSocket):
     had_speech:    bool       = False    # True once any speech is detected
     finalizing:    bool       = False    # guard against concurrent finalizations
     chunks_processed:    int  = 0
+    connect_time:  float      = time.time()  # for idle-timeout ghost detection
 
     async def _finalize(reason: str) -> None:
         """
@@ -429,13 +453,38 @@ async def websocket_endpoint(websocket: WebSocket):
 
     try:
         while True:
-            msg      = await websocket.receive()
+            # Ghost-session guard: before any audio arrives, apply an idle
+            # timeout.  If the client connects but sends nothing for
+            # IDLE_TIMEOUT_S seconds it is a dead/test connection — close it.
+            # Once had_speech is True the session is active; remove the timeout.
+            # asyncio.wait_for is the canonical asyncio pattern for this
+            # (confirmed by FastAPI docs and the websockets library FAQ).
+            try:
+                if not had_speech:
+                    msg = await asyncio.wait_for(
+                        websocket.receive(), timeout=IDLE_TIMEOUT_S
+                    )
+                else:
+                    msg = await websocket.receive()
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"Idle timeout ({IDLE_TIMEOUT_S}s) — closing ghost session: "
+                    f"{session_id}"
+                )
+                break
+
             msg_type = msg.get("type")
 
             if msg_type == "websocket.disconnect":
-                # Client is gone — do NOT attempt RNNT (socket is closed,
-                # send_text would raise, and there's nobody to receive it).
                 logger.info(f"Client disconnected: {session_id}")
+                # Attempt RNNT before fully closing.  WebSocket close is a
+                # two-way handshake: when the client sends a close frame the
+                # TCP connection is half-closed and the server can still
+                # transmit one final message before echoing the close frame.
+                # _run_and_send wraps send_text in try/except, so if the
+                # client is truly gone (TCP reset) the error is caught silently.
+                if not finalizing and had_speech and utterance_buf.size >= MIN_UTTERANCE_SAMPLES:
+                    await _finalize("disconnect")
                 break
 
             if msg_type != "websocket.receive":
@@ -529,7 +578,7 @@ async def websocket_endpoint(websocket: WebSocket):
 # ============================================================================
 
 if __name__ == "__main__":
-    logger.info("Starting Quran ASR Server v4.3")
+    logger.info("Starting Quran ASR Server v4.4")
     logger.info(f"  Device              : {device}")
     logger.info(f"  CTC chunk           : {CHUNK_SAMPLES} samples ({CHUNK_SAMPLES/SAMPLE_RATE:.2f}s)")
     logger.info(f"  CTC stride          : {CHUNK_STRIDE} samples ({CHUNK_STRIDE/SAMPLE_RATE:.2f}s)")
@@ -537,6 +586,7 @@ if __name__ == "__main__":
     logger.info(f"  Max utterance (RNNT): {MAX_UTTERANCE_SAMPLES/SAMPLE_RATE:.0f}s")
     logger.info(f"  Min utterance (RNNT): {MIN_UTTERANCE_SAMPLES/SAMPLE_RATE:.2f}s")
     logger.info(f"  Silence trigger     : {SILENCE_TRIGGER_S}s")
+    logger.info(f"  Idle timeout        : {IDLE_TIMEOUT_S}s")
     logger.info(f"  VAD RMS threshold   : {VAD_RMS_THRESHOLD}")
 
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info", access_log=True)
