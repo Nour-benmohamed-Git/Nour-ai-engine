@@ -52,6 +52,7 @@ pip install --force-reinstall --no-deps torchaudio --index-url https://download.
 # For stable torch builds — replace cu128 with your actual CUDA tag
 pip install --force-reinstall torchvision --index-url https://download.pytorch.org/whl/cu128
 pip install --force-reinstall --no-deps torchaudio --index-url https://download.pytorch.org/whl/cu128
+pip install silero-vad
 ```
 
 > **Why `--no-deps` for torchaudio?** Without it, pip also upgrades torch to the latest nightly, which then breaks NeMo's fsspec and other dependencies. `--no-deps` installs only torchaudio itself.

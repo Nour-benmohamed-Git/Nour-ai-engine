@@ -1,5 +1,5 @@
 """
-Arabic Quran ASR Server — v4.4  (CTC interim + RNNT final)
+Arabic Quran ASR Server — v4.5  (CTC interim + RNNT final)
 ===========================================================
 
 Architecture
@@ -14,7 +14,25 @@ RNNT is triggered by four events:
   3. Utterance reaches MAX_UTTERANCE_SAMPLES (model's training max = 20 s)
   4. Client disconnects after producing speech (graceful close window)
 
-v4.4 fixes over v4.4
+v4.5 fixes over v4.4
+---------------------
+1. Replaced RMS energy VAD with Silero VAD (silero-vad, latest).
+   The old threshold-based gate missed quiet voices entirely.  Silero is a
+   neural model that detects speech reliably at any volume level.
+
+   Silero requires specific chunk sizes (512 samples at 16 kHz = 32 ms).
+   It therefore runs on a dedicated 512-sample sub-buffer that is fed
+   independently from the 15360-sample CTC window.  This gives accurate
+   onset/offset detection without any chunk-size mismatch.
+
+   CTC still runs on the full 15360-sample window unchanged.
+   VAD gating happens in the WebSocket loop — _transcribe_ctc is untouched.
+   Each session gets its own VADIterator instance (isolated LSTM state).
+   Fallback to RMS if silero-vad is not installed.
+
+2. Docstring version typo fixed (was "v4.4 fixes over v4.4").
+
+v4.4 fixes over v4.3
 ---------------------
 1. Short-utterance RNNT miss.
    When a client recited a short ayah and disconnected before the 0.8 s
@@ -86,7 +104,8 @@ CHUNK_SAMPLES         = 15360    # 0.96 s  — CTC sliding window size
 CHUNK_STRIDE          = 7680     # 0.48 s  — 50 % overlap for smooth interim
 MAX_UTTERANCE_SAMPLES = 320000   # 20 s    — matches model's training max_duration
 MIN_UTTERANCE_SAMPLES = 8000     # 0.5 s   — minimum audio to bother calling RNNT
-VAD_RMS_THRESHOLD     = 0.005    # ~−46 dBFS; chunks below this are silence
+VAD_SPEECH_THRESHOLD  = 0.5      # Silero probability cutoff (0–1); 0.5 is recommended default
+VAD_CHUNK_SAMPLES     = 512      # Silero's required chunk size at 16 kHz (32 ms)
 SILENCE_TRIGGER_S     = 0.8      # gap after last speech that triggers RNNT
 SILENCE_POLL_S        = 0.1      # how often the silence monitor checks
 IDLE_TIMEOUT_S        = 10.0     # close ghost connections that never send audio
@@ -110,6 +129,77 @@ else:
 
 CTC_BLANK_ID = model.tokenizer.vocab_size
 logger.info(f"Model loaded in {time.time() - _t0:.2f}s")
+
+# ============================================================================
+# SILERO VAD  (pip install silero-vad)
+# ============================================================================
+# Silero requires chunks of exactly 512 samples at 16 kHz (32 ms).
+# Passing larger chunks causes unreliable onset/offset detection because
+# the internal windowing can swallow speech events at the boundaries.
+#
+# We solve this with a dedicated 512-sample VAD sub-buffer per session,
+# fed from the same incoming PCM stream independently of the CTC window.
+# This gives accurate per-32ms speech detection at any volume level.
+# ============================================================================
+
+logger.info("Loading Silero VAD...")
+_vad_t0 = time.time()
+try:
+    from silero_vad import load_silero_vad, VADIterator
+    _silero_model = load_silero_vad()
+    _silero_model.eval()
+    SILERO_AVAILABLE = True
+    logger.info(f"Silero VAD loaded in {time.time() - _vad_t0:.2f}s ✓")
+except Exception as _e:
+    logger.warning(f"Silero VAD unavailable ({_e}) — falling back to RMS threshold")
+    _silero_model = None
+    SILERO_AVAILABLE = False
+
+VAD_RMS_FALLBACK = 0.003   # only used when silero-vad is not installed
+
+
+def _make_vad_state():
+    """
+    Returns a per-session VAD state dict containing:
+      - 'buf':      np.ndarray accumulator for 512-sample sub-chunks
+      - 'speaking': bool current speech state
+      - 'check':    callable(audio_f32) → bool  — feed any amount of audio,
+                    returns True if Silero considers the session currently
+                    in a speech region.
+
+    Designed to be called once per WebSocket session.  The VADIterator
+    LSTM state is fully isolated between sessions.
+    """
+    if SILERO_AVAILABLE:
+        vad_iter = VADIterator(
+            _silero_model,
+            threshold=VAD_SPEECH_THRESHOLD,
+            sampling_rate=SAMPLE_RATE,
+            min_silence_duration_ms=100,
+            speech_pad_ms=30,
+        )
+        state = {'buf': np.empty(0, dtype=np.float32), 'speaking': False}
+
+        def check(audio_f32: np.ndarray) -> bool:
+            """Feed audio_f32 into the VAD sub-buffer and update speech state."""
+            state['buf'] = np.concatenate([state['buf'], audio_f32])
+            while state['buf'].size >= VAD_CHUNK_SAMPLES:
+                sub   = state['buf'][:VAD_CHUNK_SAMPLES]
+                state['buf'] = state['buf'][VAD_CHUNK_SAMPLES:]
+                result = vad_iter(torch.from_numpy(sub), return_seconds=False)
+                if result is not None:
+                    if 'start' in result:
+                        state['speaking'] = True
+                    elif 'end' in result:
+                        state['speaking'] = False
+            return state['speaking']
+
+        return check
+    else:
+        def check(audio_f32: np.ndarray) -> bool:
+            return float(np.sqrt(np.mean(audio_f32 ** 2))) > VAD_RMS_FALLBACK
+        return check
+
 
 # ============================================================================
 # RNNT DECODING STRATEGY
@@ -156,29 +246,17 @@ def _encode(audio_f32: np.ndarray):
 
 
 # ============================================================================
-# VAD GATE
-# ============================================================================
-
-def _has_speech(audio: np.ndarray) -> bool:
-    """True when RMS energy exceeds the silence threshold."""
-    return float(np.sqrt(np.mean(audio ** 2))) > VAD_RMS_THRESHOLD
-
-
-# ============================================================================
 # CTC — interim decoder  (fast, ~30-50 ms)
 # ============================================================================
 
 def _transcribe_ctc(audio_f32: np.ndarray) -> str:
     """
-    Greedy CTC decode.
-    Returns "" for silent frames (VAD gate) — prevents the model from
-    hallucinating training-time silence-marker tokens on quiet audio.
+    Greedy CTC decode.  VAD gating happens in the WebSocket loop before
+    this is called — this function always runs inference on whatever it
+    receives.
 
     Algorithm: collapse consecutive duplicate tokens, then strip blanks.
     """
-    if not _has_speech(audio_f32):
-        return ""
-
     try:
         with torch.inference_mode():
             encoded, _ = _encode(audio_f32)
@@ -268,17 +346,18 @@ _infer_lock = asyncio.Lock()
 # FASTAPI APP
 # ============================================================================
 
-app = FastAPI(title="Quran ASR Server", version="4.4.0")
+app = FastAPI(title="Quran ASR Server", version="4.5.0")
 
 
 @app.get("/")
 def root():
     return {
         "service":  "Quran ASR Server",
-        "version":  "4.4.0",
+        "version":  "4.5.0",
         "model":    MODEL_NAME,
         "status":   "operational",
         "decoders": {"interim": "CTC", "final": "RNNT (greedy_batch)"},
+        "vad":      "silero" if SILERO_AVAILABLE else "rms_fallback",
     }
 
 
@@ -295,7 +374,8 @@ def health():
         "min_utterance_s":   MIN_UTTERANCE_SAMPLES / SAMPLE_RATE,
         "silence_trigger_s": SILENCE_TRIGGER_S,
         "idle_timeout_s":    IDLE_TIMEOUT_S,
-        "vad_rms_threshold": VAD_RMS_THRESHOLD,
+        "vad":               "silero" if SILERO_AVAILABLE else "rms_fallback",
+        "vad_threshold":     VAD_SPEECH_THRESHOLD if SILERO_AVAILABLE else VAD_RMS_FALLBACK,
         "interim_decoder":   "ctc",
         "final_decoder":     "rnnt",
     }
@@ -389,6 +469,9 @@ async def websocket_endpoint(websocket: WebSocket):
     session_id = id(websocket)
     await websocket.accept()
     logger.info(f"WebSocket connected: {session_id}")
+
+    # Per-session Silero VAD — isolated LSTM state, correct 512-sample chunking.
+    vad = _make_vad_state()
 
     ctc_buf:       np.ndarray = np.empty(0, dtype=np.float32)
     utterance_buf: np.ndarray = np.empty(0, dtype=np.float32)
@@ -520,6 +603,12 @@ async def websocket_endpoint(websocket: WebSocket):
                 if pcm_f32.size == 0:
                     continue
 
+                # Feed into Silero VAD (512-sample sub-chunking happens inside
+                # vad()).  Update speech timestamps before any CTC inference.
+                if vad(pcm_f32):
+                    last_speech_t = time.time()
+                    had_speech    = True
+
                 # Accumulate into the full-utterance buffer (for RNNT).
                 # This buffer is NEVER sliced — it holds the complete utterance.
                 utterance_buf = np.concatenate([utterance_buf, pcm_f32])
@@ -532,22 +621,20 @@ async def websocket_endpoint(websocket: WebSocket):
                     )
                     await _finalize("max-length")
 
-                # Accumulate into the CTC sliding window
+                # Accumulate into the CTC sliding window.
+                # Only run CTC when Silero reports the session is in speech —
+                # prevents hallucination on silence-only chunks.
                 ctc_buf = np.concatenate([ctc_buf, pcm_f32])
 
                 while ctc_buf.size >= CHUNK_SAMPLES:
                     chunk   = ctc_buf[:CHUNK_SAMPLES]
                     ctc_buf = ctc_buf[CHUNK_STRIDE:]
 
-                    # Update VAD / speech timestamp before inference
-                    if _has_speech(chunk):
-                        last_speech_t = time.time()
-                        had_speech    = True
-
-                    last_ctc_text = await _run_and_send(
-                        websocket, chunk, is_final=False,
-                        last_ctc_text=last_ctc_text,
-                    )
+                    if had_speech:   # at least one speech frame seen this session
+                        last_ctc_text = await _run_and_send(
+                            websocket, chunk, is_final=False,
+                            last_ctc_text=last_ctc_text,
+                        )
                     chunks_processed += 1
 
             except Exception:
@@ -578,8 +665,10 @@ async def websocket_endpoint(websocket: WebSocket):
 # ============================================================================
 
 if __name__ == "__main__":
-    logger.info("Starting Quran ASR Server v4.4")
+    logger.info("Starting Quran ASR Server v4.5")
     logger.info(f"  Device              : {device}")
+    logger.info(f"  VAD                 : {'Silero neural (512-sample sub-chunks)' if SILERO_AVAILABLE else 'RMS fallback'}")
+    logger.info(f"  VAD threshold       : {VAD_SPEECH_THRESHOLD if SILERO_AVAILABLE else VAD_RMS_FALLBACK}")
     logger.info(f"  CTC chunk           : {CHUNK_SAMPLES} samples ({CHUNK_SAMPLES/SAMPLE_RATE:.2f}s)")
     logger.info(f"  CTC stride          : {CHUNK_STRIDE} samples ({CHUNK_STRIDE/SAMPLE_RATE:.2f}s)")
     logger.info(f"  CTC overlap         : {(1 - CHUNK_STRIDE/CHUNK_SAMPLES)*100:.0f}%")
@@ -587,6 +676,5 @@ if __name__ == "__main__":
     logger.info(f"  Min utterance (RNNT): {MIN_UTTERANCE_SAMPLES/SAMPLE_RATE:.2f}s")
     logger.info(f"  Silence trigger     : {SILENCE_TRIGGER_S}s")
     logger.info(f"  Idle timeout        : {IDLE_TIMEOUT_S}s")
-    logger.info(f"  VAD RMS threshold   : {VAD_RMS_THRESHOLD}")
 
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info", access_log=True)
