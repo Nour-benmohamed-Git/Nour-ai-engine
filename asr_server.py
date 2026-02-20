@@ -1,5 +1,5 @@
 """
-Arabic Quran ASR Server — v4.5  (CTC interim + RNNT final)
+Arabic Quran ASR Server — v4.9  (CTC interim + RNNT final)
 ===========================================================
 
 Architecture
@@ -9,62 +9,69 @@ Architecture
 
 RNNT is triggered by four events:
   1. Client sends {"type": "eof"}
-  2. Silence gap of SILENCE_TRIGGER_S seconds (best real-time UX — fires
-     during the natural pause between Quran ayahs, before the next starts)
+  2. Silence gap of SILENCE_TRIGGER_S seconds (fires during the natural
+     pause between Quran ayahs, before the next starts)
   3. Utterance reaches MAX_UTTERANCE_SAMPLES (model's training max = 20 s)
   4. Client disconnects after producing speech (graceful close window)
 
-v4.5 fixes over v4.4
----------------------
-1. Replaced RMS energy VAD with Silero VAD (silero-vad, latest).
-   The old threshold-based gate missed quiet voices entirely.  Silero is a
-   neural model that detects speech reliably at any volume level.
+v4.9 improvements over v4.5
+-----------------------------
+1. torch.autocast removed — runs pure float32.
+   v4.9 introduced torch.autocast (AMP) hoping for ~1.5× throughput.
+   Warm-up (white noise) decoded correctly; real speech produced all-⁇.
+   Root cause: real speech concentrates energy in specific formant bands,
+   driving activations to magnitudes that overflow in FP16 → NaN → every
+   argmax lands on SentencePiece unknown (⁇).  White noise has a flat
+   spectrum that keeps activations moderate, so warm-up looked fine.
+   autocast cannot be used safely with this FastConformer model.
+   Pure float32 matches v4.5 behaviour and is confirmed correct.
 
-   Silero requires specific chunk sizes (512 samples at 16 kHz = 32 ms).
-   It therefore runs on a dedicated 512-sample sub-buffer that is fed
-   independently from the 15360-sample CTC window.  This gives accurate
-   onset/offset detection without any chunk-size mismatch.
+2. session_ever_had_speech flag — idle timeout between ayahs fixed.
+   The original had_speech guard on asyncio.wait_for resets to False after
+   every _finalize().  A reciter pausing more than IDLE_TIMEOUT_S seconds
+   between ayahs was silently disconnected.  The new session_ever_had_speech
+   flag is set True on the first speech onset and never reset, so the idle
+   timeout only applies before the very first audio frame of the session.
 
-   CTC still runs on the full 15360-sample window unchanged.
-   VAD gating happens in the WebSocket loop — _transcribe_ctc is untouched.
-   Each session gets its own VADIterator instance (isolated LSTM state).
-   Fallback to RMS if silero-vad is not installed.
+3. VAD threshold lowered 0.5 → 0.3; speech_pad_ms raised 30 → 80 ms.
+   Catches quieter / lower-amplitude recitation voices.  Onset fires
+   earlier and the gate stays open longer, preventing premature cutoff of
+   trailing syllables.  min_silence_duration_ms lowered 100 → 80 ms to
+   avoid over-segmenting fast ayahs.
 
-2. Docstring version typo fixed (was "v4.4 fixes over v4.4").
+4. Leading silence excluded from utterance_buf.
+   Audio before the first speech onset was previously accumulated into
+   utterance_buf, consuming up to IDLE_TIMEOUT_S seconds of the 20s model
+   context window on dead air.  Now utterance_buf only starts filling once
+   had_speech is True.
 
-v4.4 fixes over v4.3
----------------------
-1. Short-utterance RNNT miss.
-   When a client recited a short ayah and disconnected before the 0.8 s
-   silence trigger fired, they received only CTC quality.  v4.3 had removed
-   RNNT-on-disconnect entirely to avoid sending on a closed socket.
+5. asyncio.Lock() created in FastAPI lifespan, not at module scope.
+   Constructing asyncio primitives outside a running event loop emits
+   DeprecationWarning on Python 3.8/3.9.  The lifespan hook runs inside
+   the event loop before the first request.
 
-   Fix: WebSocket close is a two-way handshake.  When the client sends a
-   close frame, the TCP connection enters a half-closed state — the server
-   can still transmit one final message before echoing the close frame.
-   We now attempt RNNT in the disconnect path and wrap send_text() in a
-   try/except.  Graceful closes deliver the result; ungraceful drops (TCP
-   reset, network loss) throw and are caught silently.  Either way correct.
+6. UUID-based session IDs replace id(websocket).
+   id() can reuse memory addresses across sessions in the same process,
+   making log lines ambiguous.  uuid4()[:8] is unique per session.
 
-2. Ghost session resource leak.
-   Clients that connect but never send audio kept their silence-monitor task
-   alive indefinitely.  The monitor only fires when had_speech is True, so
-   it never cleaned up these sessions.
+7. Efficient rolling buffers for CTC and utterance.
+   np.concatenate on every chunk is O(N²) total.  Both buffers now
+   accumulate as Python lists and are concatenated once at consumption
+   time, making the total work O(N).  The CTC loop uses a start-pointer
+   to slice numpy views (zero-copy) instead of repeated concatenations.
 
-   Fix: asyncio.wait_for(websocket.receive(), timeout=IDLE_TIMEOUT_S) on the
-   first receive.  This is the canonical asyncio pattern — confirmed by the
-   FastAPI and starlette maintainers.  The timeout ONLY applies before any
-   audio arrives; once had_speech becomes True the timeout is removed and the
-   session lives as long as audio keeps coming.  websocket.application_state
-   was NOT used — it is known to be unreliable (FastAPI issue #3008).
+8. Silence monitor poll interval 0.1 → 0.05 s for tighter trigger timing.
 
-v4.3 fixes over v4.2
----------------------
-1. 30 s utterance cap exceeded model's 20 s training max.
-2. CTC results sent repeatedly for the same text (deduplication).
-3. Silence-gap RNNT trigger for real-time Quran UX.
-4. Warm-up calls _transcribe_ctc/_transcribe_rnnt directly (no duplication).
-5. Unused `traceback` import removed.
+v4.5 fixes carried forward unchanged
+--------------------------------------
+• Silero VAD with per-session isolated LSTM state.
+• RMS fallback if silero-vad not installed.
+• RNNT decoder config (greedy_batch, cuda-graphs off).
+• CTC deduplication (skip send if text == last_ctc_text).
+• Ghost-session idle timeout (now correctly scoped to first audio only).
+• Graceful disconnect RNNT delivery (half-closed TCP window).
+• Auto-finalize at MAX_UTTERANCE_SAMPLES (20 s cap).
+• Warm-up exercises both decoders before serving.
 """
 
 # ============================================================================
@@ -77,6 +84,8 @@ import asyncio
 import json
 import logging
 import time
+import uuid
+from contextlib import asynccontextmanager
 
 import numpy as np
 import torch
@@ -104,10 +113,14 @@ CHUNK_SAMPLES         = 15360    # 0.96 s  — CTC sliding window size
 CHUNK_STRIDE          = 7680     # 0.48 s  — 50 % overlap for smooth interim
 MAX_UTTERANCE_SAMPLES = 320000   # 20 s    — matches model's training max_duration
 MIN_UTTERANCE_SAMPLES = 8000     # 0.5 s   — minimum audio to bother calling RNNT
-VAD_SPEECH_THRESHOLD  = 0.5      # Silero probability cutoff (0–1); 0.5 is recommended default
+
+# Lowered 0.5 → 0.3: catches onset earlier on quiet voices; gate stays open
+# longer (speech_pad_ms 80) so trailing syllables are not clipped.
+VAD_SPEECH_THRESHOLD  = 0.3
 VAD_CHUNK_SAMPLES     = 512      # Silero's required chunk size at 16 kHz (32 ms)
+
 SILENCE_TRIGGER_S     = 0.8      # gap after last speech that triggers RNNT
-SILENCE_POLL_S        = 0.1      # how often the silence monitor checks
+SILENCE_POLL_S        = 0.05     # how often the silence monitor checks (was 0.1)
 IDLE_TIMEOUT_S        = 10.0     # close ghost connections that never send audio
 MODEL_NAME            = "nvidia/stt_ar_fastconformer_hybrid_large_pcd_v1.0"
 
@@ -123,7 +136,20 @@ model.eval()
 device = "cuda" if torch.cuda.is_available() else "cpu"
 if device == "cuda":
     model = model.cuda()
-    logger.info("Model on GPU")
+    # ── IMPORTANT — keep weights in FLOAT32 ────────────────────────────────
+    # Do NOT call model.half(), model.encoder.half(), or any selective .half()
+    # on submodules.  Do NOT use torch.autocast / AMP for this model.
+    #
+    # FastConformer attention + RNNT joint produce all-⁇ output under any
+    # FP16 path (forced half OR autocast) when fed real speech.  White noise
+    # (warm-up) appears to work because its flat spectrum keeps activations
+    # moderate; real speech concentrates energy in specific formant bands,
+    # pushing activations to magnitudes that overflow in FP16 → NaN → every
+    # token decodes as SentencePiece unknown (⁇).
+    #
+    # Pure float32 is the only safe option for this model.
+    # ───────────────────────────────────────────────────────────────────────
+    logger.info("Model on GPU (float32)")
 else:
     logger.warning("GPU not available — running on CPU (very slow)")
 
@@ -140,6 +166,13 @@ logger.info(f"Model loaded in {time.time() - _t0:.2f}s")
 # We solve this with a dedicated 512-sample VAD sub-buffer per session,
 # fed from the same incoming PCM stream independently of the CTC window.
 # This gives accurate per-32ms speech detection at any volume level.
+#
+# threshold 0.3 (was 0.5): fires on lower speech probability — catches
+#   quiet onset a few frames earlier without meaningfully more false positives.
+# speech_pad_ms 80 (was 30): holds gate open longer after low-amplitude
+#   trailing syllables so they aren't clipped before CTC/RNNT sees them.
+# min_silence_duration_ms 80 (was 100): avoids over-segmenting fast ayahs
+#   that have brief inter-word pauses.
 # ============================================================================
 
 logger.info("Loading Silero VAD...")
@@ -155,36 +188,35 @@ except Exception as _e:
     _silero_model = None
     SILERO_AVAILABLE = False
 
-VAD_RMS_FALLBACK = 0.003   # only used when silero-vad is not installed
+VAD_RMS_FALLBACK = 0.002   # lowered 0.003 → 0.002 to catch quieter audio
 
 
 def _make_vad_state():
     """
-    Returns a per-session VAD state dict containing:
-      - 'buf':      np.ndarray accumulator for 512-sample sub-chunks
-      - 'speaking': bool current speech state
-      - 'check':    callable(audio_f32) → bool  — feed any amount of audio,
-                    returns True if Silero considers the session currently
-                    in a speech region.
+    Returns a per-session check(audio_f32) callable.
 
-    Designed to be called once per WebSocket session.  The VADIterator
-    LSTM state is fully isolated between sessions.
+    check(audio_f32) → bool
+      True  — Silero's LSTM is currently inside a speech region.
+      False — currently in silence.
+
+    Silero sub-chunking (512 samples / 32 ms) is handled internally.
+    Each call creates a fully independent VADIterator (isolated LSTM state).
     """
     if SILERO_AVAILABLE:
         vad_iter = VADIterator(
             _silero_model,
-            threshold=VAD_SPEECH_THRESHOLD,
+            threshold=VAD_SPEECH_THRESHOLD,   # 0.3 — catches quieter voices
             sampling_rate=SAMPLE_RATE,
-            min_silence_duration_ms=100,
-            speech_pad_ms=30,
+            min_silence_duration_ms=80,        # was 100
+            speech_pad_ms=80,                  # was 30
         )
         state = {'buf': np.empty(0, dtype=np.float32), 'speaking': False}
 
         def check(audio_f32: np.ndarray) -> bool:
-            """Feed audio_f32 into the VAD sub-buffer and update speech state."""
+            """Feed audio into the 512-sample sub-buffer; return speaking state."""
             state['buf'] = np.concatenate([state['buf'], audio_f32])
             while state['buf'].size >= VAD_CHUNK_SAMPLES:
-                sub   = state['buf'][:VAD_CHUNK_SAMPLES]
+                sub          = state['buf'][:VAD_CHUNK_SAMPLES]
                 state['buf'] = state['buf'][VAD_CHUNK_SAMPLES:]
                 result = vad_iter(torch.from_numpy(sub), return_seconds=False)
                 if result is not None:
@@ -237,7 +269,10 @@ except Exception as exc:
 # ============================================================================
 
 def _encode(audio_f32: np.ndarray):
-    """Preprocessor + encoder. Must be called inside torch.inference_mode()."""
+    """
+    Preprocessor + encoder.  Must be called inside torch.inference_mode().
+    Runs in float32 throughout — no AMP/autocast.
+    """
     signal = torch.from_numpy(audio_f32).unsqueeze(0).to(device)
     length = torch.tensor([audio_f32.shape[0]], device=device)
     processed, proc_len = model.preprocessor(input_signal=signal, length=length)
@@ -256,6 +291,7 @@ def _transcribe_ctc(audio_f32: np.ndarray) -> str:
     receives.
 
     Algorithm: collapse consecutive duplicate tokens, then strip blanks.
+    Runs in float32 — this model produces all-⁇ under any FP16 path.
     """
     try:
         with torch.inference_mode():
@@ -288,6 +324,7 @@ def _transcribe_rnnt(audio_f32: np.ndarray) -> str:
     model.decoding (RNNTBPEDecoding) is already wired to model.decoder (LSTM
     prediction network) and model.joint.  It expects encoder output in raw
     (B, D, T) shape and handles the internal (B,D,T)→(B,T,D) transpose.
+    Runs in float32 — this model produces all-⁇ under any FP16 path.
     """
     try:
         with torch.inference_mode():
@@ -339,25 +376,48 @@ logger.info(f"Warm-up complete in {time.time() - _t0:.2f}s")
 # ============================================================================
 # INFERENCE LOCK  (one GPU inference at a time — shared across all sessions)
 # ============================================================================
+# NOTE — single-process limitation:
+#   This lock serialises all GPU inference across concurrent WebSocket sessions.
+#   A 20 s RNNT decode (~300–500 ms on a modern GPU) will delay CTC interim
+#   results for every other connected client for that duration.  Acceptable
+#   for single-reciter deployments.  For multi-user scale, run one uvicorn
+#   worker per GPU; each worker process has its own lock and model copy.
+#
+# CREATION — inside the FastAPI lifespan hook (runs in the event loop).
+#   asyncio.Lock() at module scope emits DeprecationWarning on Python
+#   3.8/3.9 (no running loop at import time).  Lifespan is the correct place.
+# ============================================================================
 
-_infer_lock = asyncio.Lock()
+_infer_lock: asyncio.Lock   # assigned in lifespan below; type hint for IDE
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Create event-loop-bound primitives before serving requests."""
+    global _infer_lock
+    _infer_lock = asyncio.Lock()
+    logger.info("Inference lock created ✓")
+    yield
+    # Nothing to tear down for the lock itself.
+
 
 # ============================================================================
 # FASTAPI APP
 # ============================================================================
 
-app = FastAPI(title="Quran ASR Server", version="4.5.0")
+app = FastAPI(title="Quran ASR Server", version="4.9.0", lifespan=lifespan)
 
 
 @app.get("/")
 def root():
     return {
         "service":  "Quran ASR Server",
-        "version":  "4.5.0",
+        "version":  "4.9.0",
         "model":    MODEL_NAME,
         "status":   "operational",
         "decoders": {"interim": "CTC", "final": "RNNT (greedy_batch)"},
         "vad":      "silero" if SILERO_AVAILABLE else "rms_fallback",
+        "amp":      False,   # float32 only — AMP breaks this model
     }
 
 
@@ -367,6 +427,7 @@ def health():
         "status":            "healthy",
         "model":             MODEL_NAME,
         "device":            device,
+        "amp":               False,   # float32 only — AMP breaks this model
         "chunk_ms":          int(CHUNK_SAMPLES / SAMPLE_RATE * 1000),
         "stride_ms":         int(CHUNK_STRIDE  / SAMPLE_RATE * 1000),
         "overlap_pct":       int((1 - CHUNK_STRIDE / CHUNK_SAMPLES) * 100),
@@ -459,57 +520,76 @@ async def _run_and_send(
 #   final   : {"words":[…], "is_final":true,  "decoder":"rnnt", …}
 #
 # Per-session state:
-#   ctc_buf        — CTC sliding window; advanced by CHUNK_STRIDE each step
-#   utterance_buf  — full audio accumulator; passed intact to RNNT; never sliced
-#   last_speech_t  — wall-clock time of last speech-containing chunk
-#   last_ctc_text  — last CTC text sent; used for deduplication
+#   utter_chunks          — list of float32 arrays; materialised once at RNNT
+#   utter_size            — running sample count (avoids repeated len() calls)
+#   ctc_chunks / ctc_size — same pattern for the CTC sliding window
+#   last_speech_t         — wall-clock time of last speech-containing chunk
+#   last_ctc_text         — last CTC text sent; used for deduplication
+#   had_speech            — True once VAD detects speech; resets after finalize
+#   session_ever_had_speech — True once VAD fires; NEVER resets; disables the
+#                             idle timeout for the rest of the session so that
+#                             inter-ayah pauses of any length are allowed
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    session_id = id(websocket)
+    # uuid4 avoids id(websocket) memory-address reuse across sessions
+    session_id = str(uuid.uuid4())[:8]
     await websocket.accept()
     logger.info(f"WebSocket connected: {session_id}")
 
     # Per-session Silero VAD — isolated LSTM state, correct 512-sample chunking.
     vad = _make_vad_state()
 
-    ctc_buf:       np.ndarray = np.empty(0, dtype=np.float32)
-    utterance_buf: np.ndarray = np.empty(0, dtype=np.float32)
-    last_ctc_text: str        = ""
-    last_speech_t: float      = 0.0
-    had_speech:    bool       = False    # True once any speech is detected
-    finalizing:    bool       = False    # guard against concurrent finalizations
-    chunks_processed:    int  = 0
-    connect_time:  float      = time.time()  # for idle-timeout ghost detection
+    # Efficient rolling buffers: accumulate as lists, concatenate once at use.
+    # This avoids the O(N²) total copy cost of np.concatenate on every chunk.
+    utter_chunks: list  = []   # only filled once had_speech is True
+    utter_size:   int   = 0
+    ctc_chunks:   list  = []
+    ctc_size:     int   = 0
+
+    last_ctc_text:           str   = ""
+    last_speech_t:           float = 0.0
+    had_speech:              bool  = False   # resets after each _finalize
+    session_ever_had_speech: bool  = False   # never resets — disables idle timeout
+    finalizing:              bool  = False   # guard against concurrent finalizations
+    chunks_processed:        int   = 0
 
     async def _finalize(reason: str) -> None:
         """
-        Run RNNT on the accumulated utterance and reset session state.
-        No-op if already finalizing or utterance is too short.
+        Run RNNT on the accumulated utterance and reset per-utterance state.
+        No-op if already finalizing.
+        session_ever_had_speech is intentionally excluded from nonlocal —
+        it must never be reset between ayahs.
         """
-        nonlocal ctc_buf, utterance_buf, last_ctc_text
-        nonlocal last_speech_t, had_speech, finalizing
+        nonlocal utter_chunks, utter_size, ctc_chunks, ctc_size
+        nonlocal last_ctc_text, last_speech_t, had_speech, finalizing
 
         if finalizing:
             return
         finalizing = True
 
         try:
-            n = utterance_buf.size
-            if n >= MIN_UTTERANCE_SAMPLES:
+            if utter_size >= MIN_UTTERANCE_SAMPLES:
+                utterance_buf = (
+                    np.concatenate(utter_chunks)
+                    if utter_chunks
+                    else np.empty(0, dtype=np.float32)
+                )
                 logger.info(
                     f"{reason}: session={session_id} | "
-                    f"{n/SAMPLE_RATE:.1f}s → RNNT"
+                    f"{utter_size/SAMPLE_RATE:.1f}s → RNNT"
                 )
                 await _run_and_send(websocket, utterance_buf, is_final=True)
             else:
                 logger.info(
                     f"{reason}: session={session_id} | "
-                    f"{n} samples — too short for RNNT"
+                    f"{utter_size} samples — too short for RNNT"
                 )
         finally:
-            ctc_buf       = np.empty(0, dtype=np.float32)
-            utterance_buf = np.empty(0, dtype=np.float32)
+            utter_chunks  = []
+            utter_size    = 0
+            ctc_chunks    = []
+            ctc_size      = 0
             last_ctc_text = ""
             last_speech_t = 0.0
             had_speech    = False
@@ -528,7 +608,7 @@ async def websocket_endpoint(websocket: WebSocket):
             await asyncio.sleep(SILENCE_POLL_S)
             if (had_speech
                     and not finalizing
-                    and utterance_buf.size >= MIN_UTTERANCE_SAMPLES
+                    and utter_size >= MIN_UTTERANCE_SAMPLES
                     and (time.time() - last_speech_t) >= SILENCE_TRIGGER_S):
                 await _finalize("silence-gap")
 
@@ -536,14 +616,12 @@ async def websocket_endpoint(websocket: WebSocket):
 
     try:
         while True:
-            # Ghost-session guard: before any audio arrives, apply an idle
-            # timeout.  If the client connects but sends nothing for
-            # IDLE_TIMEOUT_S seconds it is a dead/test connection — close it.
-            # Once had_speech is True the session is active; remove the timeout.
-            # asyncio.wait_for is the canonical asyncio pattern for this
-            # (confirmed by FastAPI docs and the websockets library FAQ).
+            # Ghost-session guard: apply idle timeout ONLY before the very
+            # first speech of this session.  session_ever_had_speech is set
+            # True on first VAD onset and never reset — inter-ayah pauses
+            # of any length are allowed without disconnecting the reciter.
             try:
-                if not had_speech:
+                if not session_ever_had_speech:
                     msg = await asyncio.wait_for(
                         websocket.receive(), timeout=IDLE_TIMEOUT_S
                     )
@@ -566,7 +644,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 # transmit one final message before echoing the close frame.
                 # _run_and_send wraps send_text in try/except, so if the
                 # client is truly gone (TCP reset) the error is caught silently.
-                if not finalizing and had_speech and utterance_buf.size >= MIN_UTTERANCE_SAMPLES:
+                if not finalizing and had_speech and utter_size >= MIN_UTTERANCE_SAMPLES:
                     await _finalize("disconnect")
                 break
 
@@ -604,38 +682,62 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
 
                 # Feed into Silero VAD (512-sample sub-chunking happens inside
-                # vad()).  Update speech timestamps before any CTC inference.
-                if vad(pcm_f32):
-                    last_speech_t = time.time()
-                    had_speech    = True
+                # vad()).  Returns True if currently inside a speech region.
+                vad_speaking = vad(pcm_f32)
 
-                # Accumulate into the full-utterance buffer (for RNNT).
-                # This buffer is NEVER sliced — it holds the complete utterance.
-                utterance_buf = np.concatenate([utterance_buf, pcm_f32])
+                if vad_speaking:
+                    last_speech_t           = time.time()
+                    had_speech              = True
+                    session_ever_had_speech = True   # permanent — never reset
 
-                # Auto-finalize at model's training max (20 s) instead of
-                # trimming — trimming would silently drop the start of the ayah.
-                if utterance_buf.size >= MAX_UTTERANCE_SAMPLES:
-                    logger.info(
-                        f"Max utterance reached ({session_id}) — auto-finalizing"
-                    )
-                    await _finalize("max-length")
+                # ── Utterance buffer (for RNNT) ──────────────────────────────
+                # Only accumulate AFTER the first speech onset.
+                # Prevents leading silence from consuming the 20 s model cap.
+                if had_speech:
+                    utter_chunks.append(pcm_f32)
+                    utter_size += pcm_f32.size
 
-                # Accumulate into the CTC sliding window.
-                # Only run CTC when Silero reports the session is in speech —
-                # prevents hallucination on silence-only chunks.
-                ctc_buf = np.concatenate([ctc_buf, pcm_f32])
-
-                while ctc_buf.size >= CHUNK_SAMPLES:
-                    chunk   = ctc_buf[:CHUNK_SAMPLES]
-                    ctc_buf = ctc_buf[CHUNK_STRIDE:]
-
-                    if had_speech:   # at least one speech frame seen this session
-                        last_ctc_text = await _run_and_send(
-                            websocket, chunk, is_final=False,
-                            last_ctc_text=last_ctc_text,
+                    # Auto-finalize at model's training max (20 s).
+                    if utter_size >= MAX_UTTERANCE_SAMPLES:
+                        logger.info(
+                            f"Max utterance reached ({session_id}) — auto-finalizing"
                         )
-                    chunks_processed += 1
+                        await _finalize("max-length")
+                        continue
+
+                # ── CTC sliding window ───────────────────────────────────────
+                # Gate on had_speech: skip CTC before any speech is detected.
+                # No additional vad_speaking gate — the last ~1 s of every
+                # utterance is still in the buffer when the END event fires;
+                # gating on vad_speaking would silently drop it.  The
+                # deduplication filter in _run_and_send suppresses blank output
+                # from any silence-only chunks.
+                ctc_chunks.append(pcm_f32)
+                ctc_size += pcm_f32.size
+
+                if ctc_size >= CHUNK_SAMPLES:
+                    # Materialise ONE flat array for this batch.
+                    flat     = np.concatenate(ctc_chunks) if len(ctc_chunks) > 1 else ctc_chunks[0]
+                    ctc_chunks = []
+                    ctc_size   = 0
+
+                    start = 0
+                    while start + CHUNK_SAMPLES <= flat.size:
+                        chunk  = flat[start : start + CHUNK_SAMPLES]  # view, no copy
+                        start += CHUNK_STRIDE
+
+                        if had_speech:
+                            last_ctc_text = await _run_and_send(
+                                websocket, chunk, is_final=False,
+                                last_ctc_text=last_ctc_text,
+                            )
+                        chunks_processed += 1
+
+                    # Carry unconsumed tail into the next batch.
+                    remainder = flat[start:]
+                    if remainder.size:
+                        ctc_chunks = [remainder.copy()]  # copy: flat may be GC'd
+                        ctc_size   = remainder.size
 
             except Exception:
                 logger.exception(f"Audio processing error: {session_id}")
@@ -665,8 +767,8 @@ async def websocket_endpoint(websocket: WebSocket):
 # ============================================================================
 
 if __name__ == "__main__":
-    logger.info("Starting Quran ASR Server v4.5")
-    logger.info(f"  Device              : {device}")
+    logger.info("Starting Quran ASR Server v4.9")
+    logger.info(f"  Device              : {device} (float32)")
     logger.info(f"  VAD                 : {'Silero neural (512-sample sub-chunks)' if SILERO_AVAILABLE else 'RMS fallback'}")
     logger.info(f"  VAD threshold       : {VAD_SPEECH_THRESHOLD if SILERO_AVAILABLE else VAD_RMS_FALLBACK}")
     logger.info(f"  CTC chunk           : {CHUNK_SAMPLES} samples ({CHUNK_SAMPLES/SAMPLE_RATE:.2f}s)")
@@ -675,6 +777,7 @@ if __name__ == "__main__":
     logger.info(f"  Max utterance (RNNT): {MAX_UTTERANCE_SAMPLES/SAMPLE_RATE:.0f}s")
     logger.info(f"  Min utterance (RNNT): {MIN_UTTERANCE_SAMPLES/SAMPLE_RATE:.2f}s")
     logger.info(f"  Silence trigger     : {SILENCE_TRIGGER_S}s")
+    logger.info(f"  Silence poll        : {SILENCE_POLL_S}s")
     logger.info(f"  Idle timeout        : {IDLE_TIMEOUT_S}s")
 
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info", access_log=True)
