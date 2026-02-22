@@ -462,68 +462,29 @@ def health():
 
 
 # ============================================================================
-# INFERENCE + SEND HELPER
+# INFERENCE HELPER
+# ============================================================================
+# _infer is responsible for ONE thing only: acquire the lock, run the decoder,
+# return text.  All decisions about whether and how to send the result belong
+# to the caller, which owns the session state needed to make those decisions.
+#
+# Keeping inference and sending separate is what allows the CTC caller to
+# check had_speech AFTER inference completes — catching the case where
+# _finalize fired and reset had_speech while this call was waiting behind an
+# RNNT lock acquisition.  If send logic lived here, that check would be
+# impossible without leaking session state into this helper.
 # ============================================================================
 
-async def _run_and_send(
-    websocket:    WebSocket,
-    audio_f32:    np.ndarray,
-    is_final:     bool,
-    *,
-    last_ctc_text: str = "",   # for interim deduplication; ignored for final
-) -> str:
+async def _infer(audio_f32: np.ndarray, is_final: bool) -> str:
     """
-    Run the appropriate decoder on audio and send the result to the client.
-
-    For interim (CTC): skips send if the text is identical to last_ctc_text.
-    For final   (RNNT): always sends (each utterance is a new event).
-
-    Returns the text that was sent, or "" if nothing was sent.
+    Acquire the inference lock, run the appropriate decoder, return text.
+    Returns "" on empty input or inference error.
     """
     if audio_f32.size == 0:
         return ""
-
     fn = _transcribe_rnnt if is_final else _transcribe_ctc
-    t0 = time.time()
-
     async with _infer_lock:
-        text = await asyncio.to_thread(fn, audio_f32)
-
-    if not text:
-        return ""
-
-    # Deduplication: don't send the same CTC result twice in a row
-    if not is_final and text == last_ctc_text:
-        return ""
-
-    words         = text.split()
-    processing_ms = int((time.time() - t0) * 1000)
-
-    payload = json.dumps({
-        "words":         words,
-        "is_final":      is_final,
-        "decoder":       "rnnt" if is_final else "ctc",
-        "chunk_ms":      int(audio_f32.size / SAMPLE_RATE * 1000),
-        "processing_ms": processing_ms,
-    }, ensure_ascii=False)
-
-    try:
-        await websocket.send_text(payload)
-    except (WebSocketDisconnect, RuntimeError):
-        # Client disconnected during inference (e.g. graceful close window
-        # elapsed or TCP reset).  The result was computed — it just couldn't
-        # be delivered.  Log at debug level and return "" so callers know
-        # nothing was transmitted.
-        logger.debug(
-            f"send_text failed — client gone during inference: {text[:60]}"
-        )
-        return ""
-
-    logger.info(
-        f"{'FINAL(RNNT)' if is_final else 'interim(CTC)'} | "
-        f"{len(words)} words | {processing_ms}ms | {text[:80]}"
-    )
-    return text
+        return await asyncio.to_thread(fn, audio_f32)
 
 
 # ============================================================================
@@ -601,7 +562,25 @@ async def websocket_endpoint(websocket: WebSocket):
                     f"{reason}: session={session_id} | "
                     f"{utter_size/SAMPLE_RATE:.1f}s → RNNT"
                 )
-                await _run_and_send(websocket, utterance_buf, is_final=True)
+                t0   = time.time()
+                text = await _infer(utterance_buf, is_final=True)
+                if text:
+                    words         = text.split()
+                    processing_ms = int((time.time() - t0) * 1000)
+                    payload = json.dumps({
+                        "words":         words,
+                        "is_final":      True,
+                        "decoder":       "rnnt",
+                        "chunk_ms":      int(utterance_buf.size / SAMPLE_RATE * 1000),
+                        "processing_ms": processing_ms,
+                    }, ensure_ascii=False)
+                    try:
+                        await websocket.send_text(payload)
+                    except (WebSocketDisconnect, RuntimeError):
+                        # Half-closed TCP: result computed but not deliverable.
+                        logger.debug(f"send_text failed — client gone during RNNT: {text[:60]}")
+                    else:
+                        logger.info(f"FINAL(RNNT) | {len(words)} words | {processing_ms}ms | {text[:80]}")
             else:
                 logger.info(
                     f"{reason}: session={session_id} | "
@@ -664,7 +643,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 # two-way handshake: when the client sends a close frame the
                 # TCP connection is half-closed and the server can still
                 # transmit one final message before echoing the close frame.
-                # _run_and_send wraps send_text in try/except, so if the
+                # send_text in _finalize is wrapped in try/except, so if the
                 # client is truly gone (TCP reset) the error is caught silently.
                 if not finalizing and had_speech and utter_size >= MIN_UTTERANCE_SAMPLES:
                     await _finalize("disconnect")
@@ -738,7 +717,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 # No additional vad_speaking gate — the last ~1 s of every
                 # utterance is still in the buffer when the END event fires;
                 # gating on vad_speaking would silently drop trailing syllables.
-                # The deduplication filter in _run_and_send suppresses blank
+                # The deduplication check in the CTC send block suppresses blank
                 # output from any silence-only chunks within an utterance.
                 if had_speech:
                     ctc_chunks.append(pcm_f32)
@@ -756,15 +735,35 @@ async def websocket_endpoint(websocket: WebSocket):
                         start += CHUNK_STRIDE
 
                         if had_speech:
-                            last_ctc_text = await _run_and_send(
-                                websocket, chunk, is_final=False,
-                                last_ctc_text=last_ctc_text,
-                            )
+                            t0   = time.time()
+                            text = await _infer(chunk, is_final=False)
+                            # Check had_speech AFTER inference completes.
+                            # If _finalize fired while this call waited behind
+                            # an RNNT lock, had_speech is now False and we
+                            # discard the result — eliminating the stray CTC
+                            # interim that previously leaked after every RNNT.
+                            if had_speech and text and text != last_ctc_text:
+                                words         = text.split()
+                                processing_ms = int((time.time() - t0) * 1000)
+                                payload = json.dumps({
+                                    "words":         words,
+                                    "is_final":      False,
+                                    "decoder":       "ctc",
+                                    "chunk_ms":      int(chunk.size / SAMPLE_RATE * 1000),
+                                    "processing_ms": processing_ms,
+                                }, ensure_ascii=False)
+                                try:
+                                    await websocket.send_text(payload)
+                                except (WebSocketDisconnect, RuntimeError):
+                                    logger.debug(f"send_text failed — client gone during CTC: {text[:60]}")
+                                else:
+                                    logger.info(f"interim(CTC) | {len(words)} words | {processing_ms}ms | {text[:80]}")
+                                    last_ctc_text = text
                         chunks_processed += 1
 
                     # Carry unconsumed tail into the next batch.
                     # Guard on had_speech: if _finalize fired mid-loop (at the
-                    # await _run_and_send yield point above), it already reset
+                    # await _infer yield point above), it already reset
                     # ctc_chunks=[] and had_speech=False.  Without this guard
                     # the remainder — audio from the END of the previous ayah —
                     # would bleed into the next ayah's first CTC window.
