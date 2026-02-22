@@ -61,17 +61,6 @@ v4.9 improvements over v4.5
    to slice numpy views (zero-copy) instead of repeated concatenations.
 
 8. Silence monitor poll interval 0.1 → 0.05 s for tighter trigger timing.
-
-v4.5 fixes carried forward unchanged
---------------------------------------
-• Silero VAD with per-session isolated LSTM state.
-• RMS fallback if silero-vad not installed.
-• RNNT decoder config (greedy_batch, cuda-graphs off).
-• CTC deduplication (skip send if text == last_ctc_text).
-• Ghost-session idle timeout (now correctly scoped to first audio only).
-• Graceful disconnect RNNT delivery (half-closed TCP window).
-• Auto-finalize at MAX_UTTERANCE_SAMPLES (20 s cap).
-• Warm-up exercises both decoders before serving.
 """
 
 # ============================================================================
@@ -381,13 +370,19 @@ def _transcribe_rnnt(audio_f32: np.ndarray) -> str:
 # Use a white-noise burst (RMS ≈ 0.1) so the VAD gate passes.
 # This lets us call _transcribe_ctc and _transcribe_rnnt directly — no code
 # duplication, and we exercise the exact same paths used in production.
+#
+# default_rng(0) instead of np.random.seed(0): creates an isolated Generator
+# instance with no global side-effects.  np.random.seed() mutates the global
+# legacy random state shared with any other library in the process (scipy,
+# sklearn, etc.).  Same deterministic output, zero process-wide pollution.
 # ============================================================================
 
 logger.info("Warming up CTC + RNNT decoders...")
 _t0 = time.time()
 
-np.random.seed(0)
-_warmup_audio = (np.random.randn(SAMPLE_RATE) * 0.1).astype(np.float32)
+_warmup_audio = (
+    np.random.default_rng(0).standard_normal(SAMPLE_RATE) * 0.1
+).astype(np.float32)
 
 _ctc_text  = _transcribe_ctc(_warmup_audio)
 logger.info(f"  CTC  warm-up OK — '{_ctc_text}'")
@@ -439,7 +434,7 @@ def root():
         "version":  "4.9.0",
         "model":    MODEL_NAME,
         "status":   "operational",
-        "decoders": {"interim": "CTC", "final": "RNNT (greedy_batch)"},
+        "decoders": {"interim": "CTC", "final": "RNNT (beam search, beam_size=4)"},
         "vad":      "silero" if SILERO_AVAILABLE else "rms_fallback",
         "amp":      False,   # float32 only — AMP breaks this model
     }
@@ -462,7 +457,7 @@ def health():
         "vad":               "silero" if SILERO_AVAILABLE else "rms_fallback",
         "vad_threshold":     VAD_SPEECH_THRESHOLD if SILERO_AVAILABLE else VAD_RMS_FALLBACK,
         "interim_decoder":   "ctc",
-        "final_decoder":     "rnnt",
+        "final_decoder":     "rnnt (beam search, beam_size=4)",
     }
 
 
@@ -556,7 +551,7 @@ async def _run_and_send(
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    # uuid4 avoids id(websocket) memory-address reuse across sessions
+    # uuid4() avoids id(websocket) memory-address reuse across sessions
     session_id = str(uuid.uuid4())[:8]
     await websocket.accept()
     logger.info(f"WebSocket connected: {session_id}")
@@ -582,8 +577,11 @@ async def websocket_endpoint(websocket: WebSocket):
         """
         Run RNNT on the accumulated utterance and reset per-utterance state.
         No-op if already finalizing.
-        session_ever_had_speech is intentionally excluded from nonlocal —
-        it must never be reset between ayahs.
+
+        session_ever_had_speech is NOT reset here by design — it must remain
+        True for the full session lifetime so that inter-ayah pauses of any
+        length never trigger the idle timeout.  All other per-utterance state
+        is reset so the next ayah starts clean.
         """
         nonlocal utter_chunks, utter_size, ctc_chunks, ctc_size
         nonlocal last_ctc_text, last_speech_t, had_speech, finalizing
@@ -765,8 +763,13 @@ async def websocket_endpoint(websocket: WebSocket):
                         chunks_processed += 1
 
                     # Carry unconsumed tail into the next batch.
+                    # Guard on had_speech: if _finalize fired mid-loop (at the
+                    # await _run_and_send yield point above), it already reset
+                    # ctc_chunks=[] and had_speech=False.  Without this guard
+                    # the remainder — audio from the END of the previous ayah —
+                    # would bleed into the next ayah's first CTC window.
                     remainder = flat[start:]
-                    if remainder.size:
+                    if remainder.size and had_speech:
                         ctc_chunks = [remainder.copy()]  # copy: flat may be GC'd
                         ctc_size   = remainder.size
 
