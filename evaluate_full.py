@@ -129,7 +129,7 @@ ALL_RECITERS = [
     "Alafasy_128kbps",
     "Husary_128kbps",
     "Mohammad_al_Tablaway_128kbps",
-    "Minshawi_Murattal_128kbps",
+    "Minshawy_Murattal_128kbps",
 ]
 
 CHECKPOINT_DIR = Path("checkpoints")
