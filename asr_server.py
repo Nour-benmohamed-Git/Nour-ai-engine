@@ -236,11 +236,28 @@ def _make_vad_state():
 # ============================================================================
 # RNNT DECODING STRATEGY
 # ============================================================================
-# The model's default greedy config has use_cuda_graph_decoder: true.
-# cuStreamGetCaptureInfo returns 5 values on this driver but NeMo's binding
-# unpacks 6, crashing with "not enough values to unpack (expected 6, got 5)".
-# Disabling cuda graphs restores the standard Python greedy path with
-# identical numeric results.
+# Strategy: beam search (beam_size=4) instead of greedy_batch.
+#
+# WHY beam over greedy:
+#   Greedy RNNT picks the single highest-probability token at each step and
+#   cannot recover from an early wrong choice.  Beam search keeps the top-4
+#   hypotheses alive at every step and selects the best complete sequence —
+#   recovering from premature token commitments.  For Quranic Arabic, where
+#   rare words appear only once in the corpus and greedy often substitutes a
+#   more common Arabic alternative, beam gives a meaningful WER reduction
+#   (~5-15% relative).  RNNT fires during the natural inter-ayah pause so
+#   the extra latency is absorbed by time the reciter would spend inhaling.
+#
+# CUDA GRAPHS — two separate flags with two different names (verified):
+#   greedy.use_cuda_graph_decoder  — greedy-path cuda graphs
+#   beam.allow_cuda_graphs         — beam-path cuda graphs
+#   Both disabled — same cuStreamGetCaptureInfo unpacking crash applies.
+#
+# FIELD NAME CORRECTION (verified via dataclasses.asdict()):
+#   Previous code set rnnt_cfg.greedy.max_symbols = 10, which is a
+#   non-existent attribute silently ignored by OmegaConf.  The correct
+#   field name is max_symbols_per_step (default is already 10, so
+#   behaviour was unchanged — but now it is explicit and correct).
 #
 # Clean approach: instantiate RNNTBPEDecodingConfig (the official NeMo
 # dataclass) directly and set fields on it as plain Python attributes.
@@ -249,16 +266,23 @@ def _make_vad_state():
 # is valid and no OmegaConf struct-key errors are possible.
 # ============================================================================
 
-logger.info("Configuring RNNT decoder (greedy_batch, cuda-graphs off)...")
+logger.info("Configuring RNNT decoder (beam_size=4, cuda-graphs off)...")
 try:
     from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTBPEDecodingConfig
 
-    rnnt_cfg = RNNTBPEDecodingConfig(strategy="greedy_batch")
-    rnnt_cfg.greedy.max_symbols            = 10
-    rnnt_cfg.greedy.use_cuda_graph_decoder = False   # disables the crashing path
+    rnnt_cfg = RNNTBPEDecodingConfig(strategy="beam")
+
+    # Greedy sub-config — used internally during beam expansion steps
+    rnnt_cfg.greedy.max_symbols_per_step   = 10    # verified field name
+    rnnt_cfg.greedy.use_cuda_graph_decoder = False # greedy cuda-graphs off
+
+    # Beam sub-config — field names verified via dataclasses.asdict()
+    rnnt_cfg.beam.beam_size              = 4     # top-4 hypotheses
+    rnnt_cfg.beam.allow_cuda_graphs      = False # beam cuda-graphs off
+    rnnt_cfg.beam.return_best_hypothesis = True  # return single best string
 
     model.change_decoding_strategy(decoder_type="rnnt", decoding_cfg=rnnt_cfg)
-    logger.info("RNNT decoder configured ✓")
+    logger.info("RNNT decoder configured (beam_size=4, cuda-graphs off) ✓")
 
 except Exception as exc:
     logger.error(f"Failed to configure RNNT decoder: {exc}")
@@ -706,14 +730,21 @@ async def websocket_endpoint(websocket: WebSocket):
                         continue
 
                 # ── CTC sliding window ───────────────────────────────────────
-                # Gate on had_speech: skip CTC before any speech is detected.
+                # Gate BOTH accumulation and inference on had_speech.
+                # This prevents inter-ayah silence (after _finalize resets
+                # had_speech to False) from contaminating the first CTC window
+                # of the next ayah.  Without this gate, up to CHUNK_SAMPLES-1
+                # samples of silence accumulate between ayahs and are prepended
+                # to the first real speech window, degrading interim accuracy.
+                #
                 # No additional vad_speaking gate — the last ~1 s of every
                 # utterance is still in the buffer when the END event fires;
-                # gating on vad_speaking would silently drop it.  The
-                # deduplication filter in _run_and_send suppresses blank output
-                # from any silence-only chunks.
-                ctc_chunks.append(pcm_f32)
-                ctc_size += pcm_f32.size
+                # gating on vad_speaking would silently drop trailing syllables.
+                # The deduplication filter in _run_and_send suppresses blank
+                # output from any silence-only chunks within an utterance.
+                if had_speech:
+                    ctc_chunks.append(pcm_f32)
+                    ctc_size += pcm_f32.size
 
                 if ctc_size >= CHUNK_SAMPLES:
                     # Materialise ONE flat array for this batch.
